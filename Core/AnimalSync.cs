@@ -130,49 +130,47 @@ public class AnimalSyncHub : Hub
     [HubMethodName("sync_play")]
     public async Task HandleMsg(string messageId, string voiceChannelId, string guildId, string textChannelId, IEnumerable<string> args)
     {
-        if (!MessageHandled.TryAdd(messageId, true)) return;
+        if (!MessageHandled.TryAdd(messageId, true))
+            return;
 
         logger.LogInformation("Handling message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
 
-        var sent = false;
-
-        while (ClientQueue.TryPeek(out var clientQueue))
+        foreach (var clientQueue in ClientQueue)
         {
             foreach (var (connectionId, clientId) in clientQueue)
             {
-                if (GuildList.TryGetValue(clientId, out var clientGuildList) &&
-                    clientGuildList != null && clientGuildList.Contains(guildId))
-                {
-                    if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList))
-                    {
-                        if (clientPlayingList.TryGetValue(guildId, out var playingVoiceChannelId) &&
-                            playingVoiceChannelId == voiceChannelId)
-                        {
-                            logger.LogInformation("Handled message ID: {MessageId} at server ID: {GuildId}: Already playing at that channel.", messageId, guildId);
-                            await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
-                            sent = true;
-                            break;
-                        }
+                if (!GuildList.TryGetValue(clientId, out var clientGuildList) ||
+                    !clientGuildList.Contains(guildId))
+                    continue;
 
-                        if (!clientPlayingList.ContainsKey(guildId))
-                        {
-                            logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
-                            await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
-                            sent = true;
-                            break;
-                        }
+                if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList))
+                {
+                    if (clientPlayingList.TryGetValue(guildId, out var playingVoiceChannelId) &&
+                        playingVoiceChannelId == voiceChannelId)
+                    {
+                        logger.LogInformation("Handled message ID: {MessageId} at server ID: {GuildId}: Already playing at that channel.", messageId, guildId);
+                        await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
+                        return;
+                    }
+
+                    if (!clientPlayingList.ContainsKey(guildId))
+                    {
+                        logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
+                        await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
+                        return;
                     }
                 }
+                else
+                {
+                    logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
+                    await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
+                    return;
+                }
             }
-
-            if (sent) break;
         }
 
-        if (!sent)
-        {
-            logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
-            await Clients.Caller.SendAsync("handle_no_client", new { messageId, guildId, voiceChannelId });
-        }
+        logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
+        await Clients.Caller.SendAsync("no_client", new { messageId, guildId, voiceChannelId });
     }
 
     [HubMethodName("player_sync")]
