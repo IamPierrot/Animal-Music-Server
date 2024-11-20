@@ -1,25 +1,20 @@
 using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
+using AnimalSync.Models;
 
 namespace AnimalSync.Core;
 
-interface IPlayerList
-{
-    string VoiceChannelId { get; set; }
-    string GuildId { get; set; }
-    IEnumerable<string> MusicList { get; set; }
-}
-
 public class AnimalSyncHub : Hub
 {
-    private readonly ILogger<AnimalSyncHub> logger;
     private const string SECRET_TOKEN = "123";
+    private readonly ILogger<AnimalSyncHub> logger;
     private static readonly ConcurrentDictionary<string, IHubCallerClients> ClientList = new();
     private static readonly ConcurrentQueue<ConcurrentDictionary<string, string>> ClientQueue = new();
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
     private static readonly ConcurrentDictionary<string, bool> MessageHandled = new();
+    private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
 
     public AnimalSyncHub(ILogger<AnimalSyncHub> logger)
     {
@@ -43,7 +38,7 @@ public class AnimalSyncHub : Hub
 
         if (string.IsNullOrEmpty(secretToken) || secretToken != SECRET_TOKEN)
         {
-            await Clients.Caller.SendAsync("error", "Deny permission by wrong secret!");
+            await Clients.Caller.SendAsync("error", "Deny permission by invalid credentials!");
             logger.LogWarning("{ConnectionId} provides Invalid secret token!", Context.ConnectionId);
             return;
         }
@@ -51,48 +46,74 @@ public class AnimalSyncHub : Hub
         try
         {
             ClientList.TryAdd(clientId, Clients);
+
+            if (!ClientsPlayingList.ContainsKey(clientId))
+            {
+                ClientsPlayingList.TryAdd(clientId, new ConcurrentDictionary<string, string>());
+                var queue = new ConcurrentDictionary<string, string>();
+                queue.TryAdd(Context.ConnectionId, clientId);
+                ClientQueue.Enqueue(queue);
+            }
+
+            await Clients.Caller.SendAsync("connection", "Successfully connect to Animal Hub!");
+            logger.LogInformation("{ConnectionId} connect to server with ID: {ClientId}", Context.ConnectionId, clientId);
         }
         catch (Exception error)
         {
-            logger.LogError("{ConnectionId} has error to connect to server with ID: {ClientId}", Context.ConnectionId, clientId);
-            logger.LogError("{}", error.StackTrace);
+            logger.LogError(error, "{ConnectionId} has error to connect to server with ID: {ClientId}", Context.ConnectionId, clientId);
             await Clients.Caller.SendAsync("error", $"Error when connect to server: {error.Message}");
-            return;
         }
-
-        if (!ClientsPlayingList.ContainsKey(clientId))
-        {
-            ClientsPlayingList.TryAdd(clientId, new ConcurrentDictionary<string, string>());
-            var queue = new ConcurrentDictionary<string, string>();
-            queue.TryAdd(Context.ConnectionId, clientId);
-            ClientQueue.Enqueue(queue);
-        }
-
-        await Clients.Caller.SendAsync("connection", "Successfully connect to Animal Hub!");
-        logger.LogInformation("{ConnectionId} connect to server with ID: {ClientId}", Context.ConnectionId, clientId);
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         var clientId = Context.GetHttpContext()?.Request.Query["ClientId"].ToString();
 
-        if (string.IsNullOrEmpty(clientId) || !ClientList.ContainsKey(clientId))
+        if (string.IsNullOrEmpty(clientId))
         {
             await Clients.Caller.SendAsync("error", "Invalid or missing client ID.");
             return;
         }
 
-        ClientsPlayingList.TryRemove(clientId, out _);
-        ClientList.TryRemove(clientId, out _);
-        GuildList.TryRemove(clientId, out _);
+        try
+        {
+            ClientsPlayingList.TryRemove(clientId, out _);
+            ClientList.TryRemove(clientId, out _);
+            GuildList.TryRemove(clientId, out _);
+            PlayerList.TryRemove(clientId, out _);
+            PlayerStates.TryRemove(clientId, out _);
 
-        await Clients.Caller.SendAsync("disconnect", "Disconnect from AnimalSync Hub!");
-        logger.LogInformation("{ClientId} disconnected from server!", clientId);
+            var remainingClients = new ConcurrentQueue<ConcurrentDictionary<string, string>>();
+            while (ClientQueue.TryDequeue(out var queueItem))
+            {
+                var newDict = new ConcurrentDictionary<string, string>();
+                foreach (var kvp in queueItem.Where(kvp => kvp.Value != clientId))
+                {
+                    newDict.TryAdd(kvp.Key, kvp.Value);
+                }
+                if (!newDict.IsEmpty)
+                {
+                    remainingClients.Enqueue(newDict);
+                }
+            }
+            while (remainingClients.TryDequeue(out var item))
+            {
+                ClientQueue.Enqueue(item);
+            }
+
+            await Clients.Caller.SendAsync("disconnect", "Disconnect from AnimalSync Hub!");
+            logger.LogInformation("Client {ClientId} disconnected and all resources cleared!", clientId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error during cleanup for client {ClientId}", clientId);
+        }
 
         if (exception is not null)
             logger.LogError(exception, "Disconnection error for {ClientId}", clientId);
     }
 
+    [HubMethodName("guild_sync")]
     public async Task GuildSync(string ClientId, IEnumerable<string> guildIds)
     {
         if (!ClientList.ContainsKey(ClientId))
@@ -106,30 +127,7 @@ public class AnimalSyncHub : Hub
 
         logger.LogInformation("{ClientId} has synchronized {GuildCount} guilds to server!", ClientId, guildIds.Count());
     }
-
-    [HubMethodName("player_sync")]
-    public void PlayerSync(string ClientId, string VoiceChannelId, string GuildId, IEnumerable<string> data)
-    {
-        PlayerList.AddOrUpdate(ClientId,
-            new PlayerList { GuildId = GuildId, VoiceChannelId = VoiceChannelId, MusicList = data },
-            (_, existing) =>
-            {
-                existing.GuildId = GuildId;
-                existing.VoiceChannelId = VoiceChannelId;
-                existing.MusicList = data;
-                return existing;
-            });
-
-        if (ClientsPlayingList.TryGetValue(ClientId, out var clientPlayingList))
-        {
-            if (clientPlayingList.TryAdd(GuildId, VoiceChannelId))
-            {
-                logger.LogInformation("Client {ClientId} has started playing at {GuildId}.", ClientId, GuildId);
-            }
-        }
-    }
-
-    [HubMethodName("sync_msg")]
+    [HubMethodName("sync_play")]
     public async Task HandleMsg(string messageId, string voiceChannelId, string guildId, string textChannelId, IEnumerable<string> args)
     {
         if (!MessageHandled.TryAdd(messageId, true)) return;
@@ -151,7 +149,7 @@ public class AnimalSyncHub : Hub
                             playingVoiceChannelId == voiceChannelId)
                         {
                             logger.LogInformation("Handled message ID: {MessageId} at server ID: {GuildId}: Already playing at that channel.", messageId, guildId);
-                            await Clients.Client(connectionId).SendAsync("msg", new { messageId, guildId, textChannelId, args });
+                            await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
                             sent = true;
                             break;
                         }
@@ -159,7 +157,7 @@ public class AnimalSyncHub : Hub
                         if (!clientPlayingList.ContainsKey(guildId))
                         {
                             logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
-                            await Clients.Client(connectionId).SendAsync("msg", new { messageId, guildId, textChannelId, args });
+                            await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args });
                             sent = true;
                             break;
                         }
@@ -175,6 +173,109 @@ public class AnimalSyncHub : Hub
             logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
             await Clients.Caller.SendAsync("handle_no_client", new { messageId, guildId, voiceChannelId });
         }
+    }
+
+    [HubMethodName("player_sync")]
+    public async Task PlayerSync(string ClientId, PlayerSyncData data)
+    {
+        try
+        {
+            if (!ClientList.ContainsKey(ClientId))
+            {
+                await Clients.Caller.SendAsync("error", $"{ClientId} is not connected to Animal Hub!");
+                return;
+            }
+
+            var playerState = PlayerStates.GetOrAdd(ClientId, _ => new PlayerState());
+
+            switch (data.eventExtend)
+            {
+                case "stats":
+                    playerState.UpdateStats(data.Stats);
+                    break;
+
+                case "event":
+                    HandlePlayerEvent(ClientId, data.Event);
+                    break;
+
+                case "playerUpdate":
+                    HandlePlayerUpdate(ClientId, data.GuildId, data.State);
+                    break;
+            }
+
+            PlayerList.AddOrUpdate(ClientId,
+                new PlayerList
+                {
+                    GuildId = data.GuildId,
+                    VoiceChannelId = data.VoiceChannelId,
+                    MusicList = data.MusicList
+                },
+                (_, existing) =>
+                {
+                    existing.GuildId = data.GuildId;
+                    existing.VoiceChannelId = data.VoiceChannelId;
+                    existing.MusicList = data.MusicList;
+                    return existing;
+                });
+
+            logger.LogInformation("Updated player state for client {ClientId} in guild {GuildId}",
+                ClientId, data.GuildId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error processing player sync for client {ClientId}", ClientId);
+            await Clients.Caller.SendAsync("error", "Error processing player sync");
+        }
+    }
+
+    private void HandlePlayerEvent(string clientId, PlayerEvent? evt)
+    {
+        if (evt == null) return;
+
+        switch (evt.Type)
+        {
+            case "join":
+                if (ClientsPlayingList.TryGetValue(clientId, out var playingList))
+                {
+                    playingList.TryAdd(evt.GuildId, evt.ChannelId);
+                    logger.LogInformation("Client {ClientId} joined voice in guild {GuildId}, channel {ChannelId}",
+                        clientId, evt.GuildId, evt.ChannelId);
+                }
+                break;
+
+            case "left":
+                if (ClientsPlayingList.TryGetValue(clientId, out var list))
+                {
+                    list.TryRemove(evt.GuildId, out _);
+                    logger.LogInformation("Client {ClientId} left voice in guild {GuildId}",
+                        clientId, evt.GuildId);
+                }
+                break;
+        }
+    }
+
+    private void HandlePlayerUpdate(string clientId, string guildId, PlayerUpdateState? state)
+    {
+        if (state == null) return;
+
+        if (!state.Connected)
+        {
+            if (ClientsPlayingList.TryGetValue(clientId, out var playingList))
+            {
+                playingList.TryRemove(guildId, out _);
+                logger.LogInformation("Client {ClientId} disconnected from guild {GuildId}",
+                    clientId, guildId);
+            }
+        }
+
+        PlayerStates.AddOrUpdate(clientId,
+            _ => new PlayerState { Position = state.Position, Timestamp = state.Time },
+            (_, existing) =>
+            {
+                existing.Position = state.Position;
+                existing.Timestamp = state.Time;
+                return existing;
+            });
     }
 
     private void StartCleanupTask()
@@ -196,11 +297,4 @@ public class AnimalSyncHub : Hub
             }
         });
     }
-}
-
-public class PlayerList : IPlayerList
-{
-    public required string VoiceChannelId { get; set; }
-    public required string GuildId { get; set; }
-    public required IEnumerable<string> MusicList { get; set; }
 }
