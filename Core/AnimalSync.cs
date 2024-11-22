@@ -172,6 +172,57 @@ public class AnimalSyncHub : Hub
         logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
         await Clients.Caller.SendAsync("no_client", new { messageId, guildId, voiceChannelId });
     }
+    [HubMethodName("command_sync")]
+    public async Task CommandSync(string messageId, string guildId, string textChannelId, string? voiceChannelId)
+    {
+        if (!MessageHandled.TryAdd(messageId, true))
+            return;
+
+
+        foreach (var clientQueue in ClientQueue)
+        {
+            foreach (var (connectionId, clientId) in clientQueue)
+            {
+                if (!GuildList.TryGetValue(clientId, out var clientGuildList) ||
+                    !clientGuildList.Contains(guildId))
+                    continue;
+
+                if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList))
+                {
+                    if (clientPlayingList.TryGetValue(guildId, out var playingVoiceChannelId) &&
+                        playingVoiceChannelId == voiceChannelId)
+                    {
+                        logger.LogInformation("Handled message ID: {MessageId} at server ID: {GuildId}: Already playing at that channel.", messageId, guildId);
+                        await Clients.Client(connectionId).SendAsync("command", new { messageId, guildId, textChannelId });
+                        return;
+                    }
+
+                    if (!clientPlayingList.ContainsKey(guildId))
+                    {
+                        logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
+                        await Clients.Client(connectionId).SendAsync("command", new { messageId, guildId, textChannelId });
+                        return;
+                    }
+                }
+                else
+                {
+                    logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientId);
+                    await Clients.Client(connectionId).SendAsync("command", new { messageId, guildId, textChannelId });
+                    return;
+                }
+            }
+        }
+
+        Random random = new();
+        var list = new List<ConcurrentDictionary<string, string>>(ClientQueue);
+        var randomDict = list[random.Next(0, list.Count)];
+
+        var (connectionIdRandom, clientIdRandom) = randomDict.ElementAtOrDefault(random.Next(0, randomDict.Count));
+
+        logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientIdRandom);
+
+        await Clients.Client(connectionIdRandom).SendAsync("command", new { messageId, guildId, textChannelId });
+    }
 
     [HubMethodName("player_sync")]
     public async Task PlayerSync(string ClientId, PlayerSyncData data)
