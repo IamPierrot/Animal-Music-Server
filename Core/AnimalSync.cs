@@ -19,7 +19,7 @@ public class AnimalSyncHub : Hub
     public AnimalSyncHub(ILogger<AnimalSyncHub> logger)
     {
         this.logger = logger;
-        StartCleanupTask();
+        StartCleanupTask().Start();
     }
 
     public override async Task OnConnectedAsync()
@@ -327,13 +327,13 @@ public class AnimalSyncHub : Hub
             });
     }
 
-    private void StartCleanupTask()
+    private async Task StartCleanupTask()
     {
-        Task.Run(async () =>
+        await Task.Run(async () =>
         {
             while (true)
             {
-                await Task.Delay(TimeSpan.FromMinutes(30));
+                await Task.Delay(TimeSpan.FromMinutes(40));
                 var halfCount = MessageHandled.Count / 2;
                 var cleanedUpMessages = MessageHandled.Keys.Take(halfCount).ToArray();
 
