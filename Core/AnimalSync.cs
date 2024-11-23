@@ -19,7 +19,7 @@ public class AnimalSyncHub : Hub
     public AnimalSyncHub(ILogger<AnimalSyncHub> logger)
     {
         this.logger = logger;
-        StartCleanupTask().Start();
+        StartCleanupTask();
     }
 
     public override async Task OnConnectedAsync()
@@ -327,9 +327,9 @@ public class AnimalSyncHub : Hub
             });
     }
 
-    private async Task StartCleanupTask()
+    private void StartCleanupTask()
     {
-        await Task.Run(async () =>
+        Task.Run(async () =>
         {
             while (true)
             {
