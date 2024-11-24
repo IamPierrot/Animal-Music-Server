@@ -4,10 +4,10 @@ using AnimalSync.Models;
 
 namespace AnimalSync.Core;
 
-public class AnimalSyncHub : Hub
+public class AnimalSyncHub() : Hub
 {
     private const string SECRET_TOKEN = "123";
-    private readonly ILogger<AnimalSyncHub> logger;
+    private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
     private static readonly ConcurrentDictionary<string, IHubCallerClients> ClientList = new();
     private static readonly ConcurrentQueue<ConcurrentDictionary<string, string>> ClientQueue = new();
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
@@ -16,11 +16,25 @@ public class AnimalSyncHub : Hub
     private static readonly ConcurrentDictionary<string, bool> MessageHandled = new();
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
 
-    public AnimalSyncHub(ILogger<AnimalSyncHub> logger)
-    {
-        this.logger = logger;
-        StartCleanupTask();
-    }
+    private static readonly Timer _cleanupTimer = new(_ =>
+        {
+            try
+            {
+                var halfCount = MessageHandled.Count / 2;
+                var cleanedUpMessages = MessageHandled.Keys.Take(halfCount).ToArray();
+
+                foreach (var msg in cleanedUpMessages)
+                {
+                    MessageHandled.TryRemove(msg, out var _);
+                }
+
+                logger.LogInformation("Cleaned up {CleanedCount} message ID(s)", cleanedUpMessages.Length);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error occurred during cleanup.");
+            }
+        }, null, TimeSpan.Zero, TimeSpan.FromMinutes(40));
 
     public override async Task OnConnectedAsync()
     {
@@ -122,8 +136,8 @@ public class AnimalSyncHub : Hub
             return;
         }
 
-        GuildList.AddOrUpdate(ClientId, _ => [.. guildIds],
-            (_, existing) => [.. guildIds]);
+        GuildList.AddOrUpdate(ClientId, _ => guildIds.ToHashSet(),
+            (_, existing) => [.. existing, .. guildIds.ToHashSet()]);
 
         logger.LogInformation("{ClientId} has synchronized {GuildCount} guilds to server!", ClientId, guildIds.Count());
     }
@@ -327,23 +341,4 @@ public class AnimalSyncHub : Hub
             });
     }
 
-    private void StartCleanupTask()
-    {
-        Task.Run(async () =>
-        {
-            while (true)
-            {
-                await Task.Delay(TimeSpan.FromMinutes(40));
-                var halfCount = MessageHandled.Count / 2;
-                var cleanedUpMessages = MessageHandled.Keys.Take(halfCount).ToArray();
-
-                foreach (var msg in cleanedUpMessages)
-                {
-                    MessageHandled.TryRemove(msg, out _);
-                }
-
-                logger.LogInformation("Cleaned up {CleanedCount} message ID(s)", cleanedUpMessages.Length);
-            }
-        });
-    }
 }
