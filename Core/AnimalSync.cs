@@ -16,26 +16,6 @@ public class AnimalSyncHub : Hub
     private static readonly ConcurrentDictionary<string, bool> MessageHandled = new();
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
 
-    private static readonly Timer _cleanupTimer = new(_ =>
-    {
-        try
-        {
-            var halfCount = MessageHandled.Count / 2;
-            var cleanedUpMessages = MessageHandled.Keys.Take(halfCount).ToArray();
-
-            foreach (var msg in cleanedUpMessages)
-            {
-                MessageHandled.TryRemove(msg, out var _);
-            }
-
-            logger.LogInformation("Cleaned up {CleanedCount} message ID(s)", cleanedUpMessages.Length);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Error occurred during cleanup.");
-        }
-    }, null, TimeSpan.Zero, TimeSpan.FromMinutes(40));
-
     public override async Task OnConnectedAsync()
     {
         var httpContext = Context.GetHttpContext();
@@ -123,47 +103,91 @@ public class AnimalSyncHub : Hub
     [HubMethodName("sync_play")]
     public async Task HandleMsg(string messageId, string voiceChannelId, string guildId, string textChannelId, IEnumerable<string> args)
     {
-        if (!MessageHandled.TryAdd(messageId, true))
-            return;
-
-        logger.LogInformation("Handling message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
-
-        foreach (var clientQueue in ClientQueue)
+        if (MessageHandled.ContainsKey(messageId))
         {
-            foreach (var (connectionId, clientId) in clientQueue)
-            {
-                if (IsClientEligibleForMessage(clientId, guildId, voiceChannelId, out var playingVoiceChannelId))
-                {
-                    await Clients.Client(connectionId).SendAsync("play", new { messageId, guildId, textChannelId, args, connectionId });
-                    return;
-                }
-            }
+            logger.LogWarning("Message ID: {MessageId} is already being processed. Ignoring duplicate request.", messageId);
+            return;
         }
 
-        logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
-        await Clients.Caller.SendAsync("no_client", new { messageId, guildId, voiceChannelId });
+        MessageHandled[messageId] = false;
+
+        try
+        {
+            logger.LogInformation("Handling message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
+
+            foreach (var clientQueue in ClientQueue)
+            {
+                foreach (var (connectionId, clientId) in clientQueue)
+                {
+                    if (IsClientEligibleForMessage(clientId, guildId, voiceChannelId, out var playingVoiceChannelId))
+                    {
+                        await Clients.Client(connectionId).SendAsync("play", new
+                        {
+                            messageId,
+                            guildId,
+                            textChannelId,
+                            args,
+                            connectionId
+                        });
+
+                        logger.LogInformation("Message ID: {MessageId} sent to connection ID: {ConnectionId}", messageId, connectionId);
+                        return;
+                    }
+                }
+            }
+
+            logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
+            await Clients.Caller.SendAsync("no_client", new { messageId, guildId, voiceChannelId });
+        }
+        finally
+        {
+            MessageHandled.TryRemove(messageId, out _);
+        }
     }
+
 
     [HubMethodName("command_sync")]
     public async Task CommandSync(string messageId, string guildId, string textChannelId, string? voiceChannelId)
     {
-        if (!MessageHandled.TryAdd(messageId, true))
-            return;
-
-        foreach (var clientQueue in ClientQueue)
+        if (MessageHandled.ContainsKey(messageId))
         {
-            foreach (var (connectionId, clientId) in clientQueue)
-            {
-                if (IsClientEligibleForMessage(clientId, guildId, voiceChannelId, out var playingVoiceChannelId))
-                {
-                    await Clients.Client(connectionId).SendAsync("command", new { messageId, guildId, textChannelId, connectionId });
-                    return;
-                }
-            }
+            logger.LogWarning("Message ID: {MessageId} is already being processed. Ignoring duplicate request.", messageId);
+            return;
         }
 
-        AssignMessageToRandomClient(messageId, guildId, textChannelId);
+        MessageHandled[messageId] = false;
+
+        try
+        {
+            foreach (var clientQueue in ClientQueue)
+            {
+                foreach (var (connectionId, clientId) in clientQueue)
+                {
+                    if (IsClientEligibleForMessage(clientId, guildId, voiceChannelId, out var playingVoiceChannelId))
+                    {
+                        await Clients.Client(connectionId).SendAsync("command", new
+                        {
+                            messageId,
+                            guildId,
+                            textChannelId,
+                            connectionId
+                        });
+
+                        logger.LogInformation("Command message ID: {MessageId} sent to connection ID: {ConnectionId}", messageId, connectionId);
+                        return;
+                    }
+                }
+            }
+
+            await AssignMessageToRandomClient(messageId, guildId, textChannelId);
+        }
+        finally
+        {
+            MessageHandled.TryRemove(messageId, out _);
+        }
     }
+
+
 
     [HubMethodName("player_sync")]
     public async Task PlayerSync(string ClientId, PlayerSyncData data)
@@ -301,33 +325,23 @@ public class AnimalSyncHub : Hub
 
         if (!GuildList.TryGetValue(clientId, out var clientGuildList) ||
             !clientGuildList.Contains(guildId))
+        {
             return false;
-
-        if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList))
-        {
-            if (clientPlayingList.TryGetValue(guildId, out playingVoiceChannelId) &&
-                playingVoiceChannelId == voiceChannelId)
-            {
-                logger.LogInformation("Handled message at server ID: {GuildId}: Already playing at that channel.", guildId);
-                return true;
-            }
-
-            if (!clientPlayingList.ContainsKey(guildId))
-            {
-                logger.LogInformation("Assigned message at server ID: {GuildId} to client: {ClientId}.", guildId, clientId);
-                return true;
-            }
         }
-        else
+
+        if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList) &&
+            clientPlayingList.TryGetValue(guildId, out playingVoiceChannelId) &&
+            playingVoiceChannelId == voiceChannelId)
         {
-            logger.LogInformation("Assigned message at server ID: {GuildId} to client: {ClientId}.", guildId, clientId);
+            logger.LogInformation("Handled message at server ID: {GuildId}: Already playing at that channel.", guildId);
             return true;
         }
 
-        return false;
+        logger.LogInformation("Assigned message at server ID: {GuildId} to client: {ClientId}.", guildId, clientId);
+        return true;
     }
 
-    private void AssignMessageToRandomClient(string messageId, string guildId, string textChannelId)
+    private async Task AssignMessageToRandomClient(string messageId, string guildId, string textChannelId)
     {
         Random random = new();
         var list = new List<ConcurrentDictionary<string, string>>(ClientQueue);
@@ -337,6 +351,6 @@ public class AnimalSyncHub : Hub
 
         logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientIdRandom);
 
-        Clients.Client(connectionIdRandom).SendAsync("command", new { messageId, guildId, textChannelId, connectionId = connectionIdRandom });
+        await Clients.Client(connectionIdRandom).SendAsync("command", new { messageId, guildId, textChannelId, connectionId = connectionIdRandom });
     }
 }
