@@ -13,10 +13,8 @@ public class AnimalSyncHub : Hub
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
-    private static readonly ConcurrentDictionary<string, bool> MessageHandled = new();
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
 
-    private readonly ConcurrentDictionary<string, DateTime> _messageProcessingTracker = [];
 
     public override async Task OnConnectedAsync()
     {
@@ -104,6 +102,8 @@ public class AnimalSyncHub : Hub
 
     private record ClientEligibility(bool IsEligible, bool IsPlaying);
 
+    private readonly static ConcurrentDictionary<string, SemaphoreSlim> _messageLocks = new();
+
     [HubMethodName("sync_play")]
     public async Task HandleMsg(string messageId, string voiceChannelId, string guildId, string textChannelId, IEnumerable<string> args)
     {
@@ -119,18 +119,17 @@ public class AnimalSyncHub : Hub
 
     private async Task ProcessMessage(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)
     {
-        CleanupOldMessages();
+        var messageLock = _messageLocks.GetOrAdd(messageId, _ => new SemaphoreSlim(1, 1));
 
-        if (!_messageProcessingTracker.TryAdd(messageId, DateTime.UtcNow))
-        {
-            logger.LogWarning("Message ID: {MessageId} is already being processed. Ignoring duplicate request.", messageId);
-            return;
-        }
-
-        // MessageHandled[messageId] = false;
-        
         try
         {
+            bool lockAcquired = await messageLock.WaitAsync(TimeSpan.FromSeconds(10));
+            if (!lockAcquired)
+            {
+                logger.LogWarning("Could not acquire lock for message ID: {MessageId}. Operation timed out.", messageId);
+                return;
+            }
+
             logger.LogInformation("Processing message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
 
             if (action == "command" && string.IsNullOrEmpty(voiceChannelId))
@@ -164,28 +163,18 @@ public class AnimalSyncHub : Hub
             }
             else await AssignMessageToRandomClient("command", messageId, guildId, textChannelId);
         }
+        catch
+        {
+            logger.LogError("Error processing message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
+            await AssignMessageToRandomClient("error", messageId, guildId, textChannelId);
+        }
         finally
         {
-            _messageProcessingTracker.TryRemove(messageId, out _);
+            messageLock.Release();
+
+            _messageLocks.TryRemove(messageId, out _);
         }
     }
-
-    private void CleanupOldMessages()
-    {
-        var cutoffTime = DateTime.UtcNow.AddMinutes(-5);
-
-        var expiredMessages = _messageProcessingTracker
-            .Where(x => x.Value < cutoffTime)
-            .Select(x => x.Key)
-            .ToList();
-
-        foreach (var messageId in expiredMessages)
-        {
-            _messageProcessingTracker.TryRemove(messageId, out _);
-            logger.LogInformation("Đã xóa message cũ {MessageId}", messageId);
-        }
-    }
-
 
     private static IEnumerable<KeyValuePair<string, ClientEligibility>> GetEligibleClients(string guildId, string? voiceChannelId)
     {
