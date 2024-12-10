@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace AnimalSync.Models;
 
 public interface IPlayerList
@@ -35,6 +37,11 @@ public class PlayerSyncData
     public Dictionary<string, object> Stats { get; set; } = [];
     public PlayerEvent? Event { get; set; }
     public PlayerUpdateState? State { get; set; }
+
+    public override string ToString()
+    {
+        return JsonSerializer.Serialize(this);
+    }
 }
 
 public class PlayerEvent
