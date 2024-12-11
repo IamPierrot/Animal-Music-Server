@@ -1,10 +1,11 @@
 using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
 using AnimalSync.Models;
+using System.Threading.Channels;
 
 namespace AnimalSync.Core;
 
-public class AnimalSyncHub : Hub
+public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
 {
     private const string SECRET_TOKEN = "123";
     private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
@@ -14,7 +15,10 @@ public class AnimalSyncHub : Hub
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
+    private static readonly ConcurrentDictionary<string, bool> ProcessedMessages = new();
 
+    private readonly IHubContext<AnimalSyncHub> _hubContext = hubContext;
+    private static readonly Task _cleanupProcessedMessages = Task.Run(CleanupProcessedMessages);
 
     public override async Task OnConnectedAsync()
     {
@@ -102,36 +106,23 @@ public class AnimalSyncHub : Hub
 
     private record ClientEligibility(bool IsEligible, bool IsPlaying);
 
-    private readonly static ConcurrentDictionary<string, SemaphoreSlim> _messageLocks = new();
-
     [HubMethodName("sync_play")]
     public async Task HandleMsg(string messageId, string voiceChannelId, string guildId, string textChannelId, IEnumerable<string> args)
     {
-
-        await ProcessMessage("play", messageId, guildId, textChannelId, voiceChannelId);
+        await EnqueueMessage("play", messageId, guildId, textChannelId, voiceChannelId);
     }
 
     [HubMethodName("command_sync")]
     public async Task CommandSync(string messageId, string guildId, string textChannelId, string? voiceChannelId)
     {
-        await ProcessMessage("command", messageId, guildId, textChannelId, voiceChannelId);
+        await EnqueueMessage("command", messageId, guildId, textChannelId, voiceChannelId);
     }
 
-    private async Task ProcessMessage(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)
-    {
-        var messageLock = _messageLocks.GetOrAdd(messageId, _ => new SemaphoreSlim(1, 1));
 
+    private async Task ProcessMessageInternal(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)
+    {
         try
         {
-            bool lockAcquired = await messageLock.WaitAsync(TimeSpan.FromSeconds(10));
-            if (!lockAcquired)
-            {
-                logger.LogWarning("Could not acquire lock for message ID: {MessageId}. Operation timed out.", messageId);
-                return;
-            }
-
-            logger.LogInformation("Processing message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
-
             if (action == "command" && string.IsNullOrEmpty(voiceChannelId))
             {
                 await AssignMessageToRandomClient(action, messageId, guildId, textChannelId);
@@ -139,18 +130,19 @@ public class AnimalSyncHub : Hub
             }
 
             var eligibleClients = GetEligibleClients(guildId, voiceChannelId);
-            // Console.WriteLine(string.Join("\n", eligibleClients.Select(kvp => $"{kvp.Key} - ({kvp.Value.IsEligible} - {kvp.Value.IsPlaying})")));
+
             foreach (var (connectionId, eligibility) in eligibleClients)
             {
                 if (eligibility.IsEligible)
                 {
-                    await Clients.Client(connectionId).SendAsync(action, new
+                    await _hubContext.Clients.Client(connectionId).SendAsync(action, new
                     {
                         messageId,
                         guildId,
                         textChannelId,
                         connectionId
                     });
+
                     logger.LogInformation("Message ID: {MessageId} sent to connection ID: {ConnectionId}", messageId, connectionId);
                     return;
                 }
@@ -161,20 +153,54 @@ public class AnimalSyncHub : Hub
                 logger.LogInformation("No eligible client for message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
                 await AssignMessageToRandomClient("no_client", messageId, guildId, textChannelId);
             }
-            else await AssignMessageToRandomClient("command", messageId, guildId, textChannelId);
+            else
+            {
+                await AssignMessageToRandomClient("command", messageId, guildId, textChannelId);
+            }
+
         }
-        catch
+        catch (Exception ex)
         {
-            logger.LogError("Error processing message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
+            logger.LogError(ex, "Error processing message ID: {MessageId} at server ID: {GuildId}.", messageId, guildId);
             await AssignMessageToRandomClient("error", messageId, guildId, textChannelId);
+        }
+
+    }
+
+    private readonly Channel<(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)> _messageQueue = Channel.CreateUnbounded<(string, string, string, string, string?)>();
+
+    public async Task ProcessMessageQueue()
+    {
+        await Task.Run(ProcessQueueAsync);
+    }
+
+    public async Task EnqueueMessage(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)
+    {
+        try
+        {
+            if (!ProcessedMessages.TryAdd(messageId, false))
+            {
+                logger.LogInformation("Message ID: {MessageId} is already in the queue or being processed.", messageId);
+                return;
+            }
+
+            await _messageQueue.Writer.WriteAsync((action, messageId, guildId, textChannelId, voiceChannelId));
+            logger.LogInformation("Message ID: {MessageId} enqueued for processing.", messageId);
         }
         finally
         {
-            messageLock.Release();
-
-            _messageLocks.TryRemove(messageId, out _);
+            _ = Task.Run(ProcessMessageQueue);
         }
     }
+
+    private async Task ProcessQueueAsync()
+    {
+        await foreach (var (action, messageId, guildId, textChannelId, voiceChannelId) in _messageQueue.Reader.ReadAllAsync())
+        {
+            await ProcessMessageInternal(action, messageId, guildId, textChannelId, voiceChannelId);
+        }
+    }
+
 
     private static IEnumerable<KeyValuePair<string, ClientEligibility>> GetEligibleClients(string guildId, string? voiceChannelId)
     {
@@ -201,7 +227,8 @@ public class AnimalSyncHub : Hub
         if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList) &&
             clientPlayingList.TryGetValue(guildId, out var playingVoiceChannelId))
         {
-            if (playingVoiceChannelId == voiceChannelId) return new ClientEligibility(true, true);
+            if (playingVoiceChannelId == voiceChannelId) 
+                return new ClientEligibility(true, true);
             return new ClientEligibility(false, true);
         }
 
@@ -258,7 +285,6 @@ public class AnimalSyncHub : Hub
         catch (Exception ex)
         {
             logger.LogError(ex, "Error processing player sync for client {ClientId}", ClientId);
-            await Clients.Caller.SendAsync("error", "Error processing player sync");
         }
     }
 
@@ -330,7 +356,7 @@ public class AnimalSyncHub : Hub
 
         logger.LogInformation("Assigned message ID: {MessageId} at server ID: {GuildId} to client: {ClientId}.", messageId, guildId, clientIdRandom);
 
-        await Clients.Client(connectionIdRandom).SendAsync(method, new { messageId, guildId, textChannelId, connectionId = connectionIdRandom });
+        await _hubContext.Clients.Client(connectionIdRandom).SendAsync(method, new { messageId, guildId, textChannelId, connectionId = connectionIdRandom });
     }
 
 
@@ -360,4 +386,22 @@ public class AnimalSyncHub : Hub
             ClientQueue.Enqueue(item);
         }
     }
+
+    private static async Task CleanupProcessedMessages()
+    {
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(5));
+            var keysToRemove = ProcessedMessages.Where(kvp => kvp.Value).Select(kvp => kvp.Key).ToList();
+            int cnt = 0;
+            foreach (var key in keysToRemove)
+            {
+                ProcessedMessages.TryRemove(key, out _);
+                cnt++;
+            }
+
+            logger.LogInformation($"Cleaned up processed message ({cnt}) IDs.");
+        }
+    }
+
 }
