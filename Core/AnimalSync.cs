@@ -5,20 +5,25 @@ using System.Threading.Channels;
 
 namespace AnimalSync.Core;
 
-public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
+public class AnimalSyncHub : Hub
 {
     private const string SECRET_TOKEN = "123";
     private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
     private static readonly ConcurrentDictionary<string, string> ClientList = new();
-    private static readonly List<string> ClientQueue = [.. new string[100]]; // Initialize with a fixed size or a dynamic size
+    private static readonly List<string> ClientQueue = []; // Initialize with a dynamic size
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
     private static readonly ConcurrentDictionary<string, bool> ProcessedMessages = new();
 
-    private readonly IHubContext<AnimalSyncHub> _hubContext = hubContext;
-    private static readonly Task _cleanupProcessedMessages = Task.Run(CleanupProcessedMessages);
+    private readonly IHubContext<AnimalSyncHub> _hubContext;
+
+    public AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext)
+    {
+        _hubContext = hubContext;
+        _ = Task.Run(CleanupProcessedMessages);
+    }
 
     public override async Task OnConnectedAsync()
     {
@@ -52,11 +57,11 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
                 {
                     if (clientIdInt - 1 >= 0 && clientIdInt - 1 < ClientQueue.Count)
                     {
-                        ClientQueue[clientIdInt - 1] = clientId;
+                        ClientQueue.Insert(clientIdInt - 1, clientId);
                     }
                     else
                     {
-                        throw new Exception("ClientId index out of bounds!");
+                        ClientQueue.Add(clientId);
                     }
                 }
                 else throw new Exception("Invalid ClientId! ClientId should be a number");
@@ -126,7 +131,6 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
     {
         await EnqueueMessage("command", messageId, guildId, textChannelId, voiceChannelId);
     }
-
 
     private async Task ProcessMessageInternal(string action, string messageId, string guildId, string textChannelId, string? voiceChannelId)
     {
@@ -210,7 +214,6 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
         }
     }
 
-
     private static IEnumerable<KeyValuePair<string, ClientEligibility>> GetEligibleClients(string guildId, string? voiceChannelId)
     {
         var eligibleClients = new Dictionary<string, ClientEligibility>();
@@ -241,7 +244,6 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
 
         return new ClientEligibility(true, false);
     }
-
 
     [HubMethodName("player_sync")]
     public async Task PlayerSync(string ClientId, PlayerSyncData data)
@@ -365,7 +367,6 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
         await _hubContext.Clients.Client(connectionIdRandom).SendAsync(method, new { messageId, guildId, textChannelId, connectionId = connectionIdRandom });
     }
 
-
     private static void RemoveClientResources(string clientId)
     {
         ClientsPlayingList.TryRemove(clientId, out _);
@@ -394,5 +395,4 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
             logger.LogInformation($"Cleaned up processed message ({cnt}) IDs.");
         }
     }
-
 }
