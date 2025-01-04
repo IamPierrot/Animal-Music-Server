@@ -9,8 +9,8 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
 {
     private const string SECRET_TOKEN = "123";
     private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
-    private static readonly ConcurrentDictionary<string, IHubCallerClients> ClientList = new();
-    private static readonly ConcurrentQueue<ConcurrentDictionary<string, string>> ClientQueue = new();
+    private static readonly ConcurrentDictionary<string, string> ClientList = new();
+    private static readonly List<string> ClientQueue = [];
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
@@ -43,14 +43,16 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
 
         try
         {
-            ClientList.TryAdd(clientId, Clients);
+            ClientList.TryAdd(clientId, Context.ConnectionId);
 
             if (!ClientsPlayingList.ContainsKey(clientId))
             {
                 ClientsPlayingList.TryAdd(clientId, new ConcurrentDictionary<string, string>());
-                var queue = new ConcurrentDictionary<string, string>();
-                queue.TryAdd(Context.ConnectionId, clientId);
-                ClientQueue.Enqueue(queue);
+                if (int.TryParse(clientId, out int clientIdInt))
+                {
+                    ClientQueue[clientIdInt - 1] = clientId;
+                }
+                else throw new Exception("Invalid ClientId! ClientId should be a number");
             }
 
             await Clients.Caller.SendAsync("connection", Context.ConnectionId);
@@ -205,13 +207,11 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
     private static IEnumerable<KeyValuePair<string, ClientEligibility>> GetEligibleClients(string guildId, string? voiceChannelId)
     {
         var eligibleClients = new Dictionary<string, ClientEligibility>();
-
-        foreach (var clientQueue in ClientQueue)
+        foreach (var clientId in ClientQueue)
         {
-            foreach (var (connectionId, clientId) in clientQueue)
-            {
-                eligibleClients[connectionId] = CheckClientEligibility(clientId, guildId, voiceChannelId);
-            }
+            var connectionId = ClientList[clientId];
+
+            eligibleClients[connectionId] = CheckClientEligibility(clientId, guildId, voiceChannelId);
         }
 
         return eligibleClients
@@ -227,7 +227,7 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
         if (ClientsPlayingList.TryGetValue(clientId, out var clientPlayingList) &&
             clientPlayingList.TryGetValue(guildId, out var playingVoiceChannelId))
         {
-            if (playingVoiceChannelId == voiceChannelId) 
+            if (playingVoiceChannelId == voiceChannelId)
                 return new ClientEligibility(true, true);
             return new ClientEligibility(false, true);
         }
@@ -341,11 +341,10 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
     private async Task AssignMessageToRandomClient(string method, string messageId, string guildId, string textChannelId)
     {
         Random random = new();
-        var eligibleClients = ClientQueue
-            .SelectMany(queue => queue)
-            .Where(kvp => GuildList.TryGetValue(kvp.Value, out var guilds) && guilds.Contains(guildId))
+        var eligibleClients = ClientQueue.Select(clientId => (ClientList[clientId], clientId))
+            .Where(client => CheckClientEligibility(client.clientId, guildId, null).IsEligible)
             .ToList();
-
+        
         if (eligibleClients.Count == 0)
         {
             logger.LogWarning("No eligible clients found for guild ID: {GuildId}.", guildId);
@@ -367,24 +366,9 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
         GuildList.TryRemove(clientId, out _);
         PlayerList.TryRemove(clientId, out _);
         PlayerStates.TryRemove(clientId, out _);
+        ClientQueue.Remove(clientId);
 
-        var remainingClients = new ConcurrentQueue<ConcurrentDictionary<string, string>>();
-        while (ClientQueue.TryDequeue(out var queueItem))
-        {
-            var newDict = new ConcurrentDictionary<string, string>();
-            foreach (var kvp in queueItem.Where(kvp => kvp.Value != clientId))
-            {
-                newDict.TryAdd(kvp.Key, kvp.Value);
-            }
-            if (!newDict.IsEmpty)
-            {
-                remainingClients.Enqueue(newDict);
-            }
-        }
-        while (remainingClients.TryDequeue(out var item))
-        {
-            ClientQueue.Enqueue(item);
-        }
+        logger.LogInformation("Client {ClientId} resources removed.", clientId);
     }
 
     private static async Task CleanupProcessedMessages()
