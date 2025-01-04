@@ -5,7 +5,7 @@ using System.Threading.Channels;
 
 namespace AnimalSync.Core;
 
-public class AnimalSyncHub : Hub
+public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
 {
     private const string SECRET_TOKEN = "123";
     private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
@@ -17,13 +17,9 @@ public class AnimalSyncHub : Hub
     private static readonly ConcurrentDictionary<string, PlayerState> PlayerStates = new();
     private static readonly ConcurrentDictionary<string, bool> ProcessedMessages = new();
 
-    private readonly IHubContext<AnimalSyncHub> _hubContext;
+    private readonly IHubContext<AnimalSyncHub> _hubContext = hubContext;
 
-    public AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext)
-    {
-        _hubContext = hubContext;
-        _ = Task.Run(CleanupProcessedMessages);
-    }
+    private static readonly Task _lmao = Task.Run(CleanupProcessedMessages);
 
     public override async Task OnConnectedAsync()
     {
