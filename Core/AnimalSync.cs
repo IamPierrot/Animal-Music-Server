@@ -10,7 +10,7 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
     private const string SECRET_TOKEN = "123";
     private static readonly ILogger<AnimalSyncHub> logger = LoggerFactory.Create(configure => configure.AddConsole()).CreateLogger<AnimalSyncHub>();
     private static readonly ConcurrentDictionary<string, string> ClientList = new();
-    private static readonly List<string> ClientQueue = [];
+    private static readonly List<string> ClientQueue = [.. new string[100]]; // Initialize with a fixed size or a dynamic size
     private static readonly ConcurrentDictionary<string, HashSet<string>> GuildList = new();
     private static readonly ConcurrentDictionary<string, IPlayerList> PlayerList = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> ClientsPlayingList = new();
@@ -50,7 +50,14 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
                 ClientsPlayingList.TryAdd(clientId, new ConcurrentDictionary<string, string>());
                 if (int.TryParse(clientId, out int clientIdInt))
                 {
-                    ClientQueue[clientIdInt - 1] = clientId;
+                    if (clientIdInt - 1 >= 0 && clientIdInt - 1 < ClientQueue.Count)
+                    {
+                        ClientQueue[clientIdInt - 1] = clientId;
+                    }
+                    else
+                    {
+                        throw new Exception("ClientId index out of bounds!");
+                    }
                 }
                 else throw new Exception("Invalid ClientId! ClientId should be a number");
             }
