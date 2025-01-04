@@ -217,6 +217,7 @@ public class AnimalSyncHub(IHubContext<AnimalSyncHub> hubContext) : Hub
         foreach (var clientId in ClientQueue)
         {
             var connectionId = ClientList[clientId];
+            Console.WriteLine($"ClientId: {clientId}, ConnectionId: {connectionId}");
 
             eligibleClients[connectionId] = CheckClientEligibility(clientId, guildId, voiceChannelId);
         }
